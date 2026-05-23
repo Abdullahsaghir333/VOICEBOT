@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(".env", ".ENV"),
+        env_file=".env",  # project secrets (see .env.custom.example)
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     public_base_url: str = "http://localhost:8000"
 
     # MongoDB
-    mongodb_uri: str = "mongodb://localhost:27017"
+    mongodb_uri: str = Field(
+        default="mongodb://localhost:27017",
+        validation_alias=AliasChoices("MONGODB_URI", "MONGO_URI"),
+    )
     mongodb_db_name: str = "voicebot"
 
     # Twilio (accepts common TWILLIO typo in .ENV files)
@@ -56,8 +59,8 @@ class Settings(BaseSettings):
 
     # App
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
-    fastapi_url: str = "http://localhost:8000"
+    api_port: int = 8001
+    fastapi_url: str = "http://127.0.0.1:8001"
 
     @property
     def deepgram_key(self) -> str:

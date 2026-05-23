@@ -24,7 +24,15 @@ async def synthesize_mulaw(text: str) -> bytes:
             mp3_buffer.write(chunk["data"])
 
     mp3_buffer.seek(0)
-    segment = AudioSegment.from_mp3(mp3_buffer)
+    if mp3_buffer.getbuffer().nbytes == 0:
+        raise RuntimeError("Edge TTS returned no audio data")
+
+    try:
+        segment = AudioSegment.from_mp3(mp3_buffer)
+    except Exception as exc:
+        raise RuntimeError(
+            "FFmpeg is required to convert TTS audio. Install FFmpeg and add to PATH."
+        ) from exc
     segment = segment.set_frame_rate(TWILIO_SAMPLE_RATE).set_channels(1)
     pcm = segment.raw_data
     return audioop.lin2ulaw(pcm, segment.sample_width)

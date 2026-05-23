@@ -1,7 +1,8 @@
 import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import appointments, calls, vapi_webhooks, webhooks
@@ -15,9 +16,15 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+
     db = get_database()
-    await db.command("ping")
-    logger.info("Connected to MongoDB")
+    try:
+        await asyncio.wait_for(db.command("ping"), timeout=8.0)
+        logger.info("Connected to MongoDB")
+    except asyncio.TimeoutError:
+        logger.error("MongoDB ping timed out — check MONGO_URI / Atlas network access")
+        raise
     yield
     await close_mongodb()
 
@@ -43,9 +50,41 @@ app.include_router(webhooks.router)
 app.include_router(vapi_webhooks.router)
 
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    ms = (time.perf_counter() - start) * 1000
+    logger.info("%s %s -> %s (%.0fms)", request.method, request.url.path, response.status_code, ms)
+    return response
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "voicebot-api"}
+
+
+@app.get("/debug/stream")
+async def debug_stream():
+    """Shows the WebSocket URL Twilio must connect to (check ngrok inspector for WS)."""
+    settings = get_settings()
+    return {
+        "media_stream_ws_url": settings.media_stream_ws_url,
+        "hint": "During a call, ngrok should show WebSocket GET /ws/media (101). Status-only = no voice.",
+    }
+
+
+@app.get("/health/tts")
+async def health_tts():
+    """Quick check: Edge TTS + FFmpeg (required for agent voice)."""
+    try:
+        from app.services.tts_service import synthesize_mulaw
+
+        audio = await synthesize_mulaw("Test.")
+        return {"status": "ok", "audio_bytes": len(audio)}
+    except Exception as exc:
+        logger.exception("TTS health check failed")
+        return {"status": "error", "detail": str(exc), "hint": "Install FFmpeg and add to PATH"}
 
 
 @app.get("/config/public")
@@ -67,8 +106,14 @@ async def public_config():
 @app.websocket("/ws/media")
 async def media_stream_ws(websocket: WebSocket):
     await websocket.accept()
-    session = MediaStreamSession(websocket)
-    await session.run()
+    logger.info("WebSocket /ws/media connected from %s", websocket.client)
+    try:
+        session = MediaStreamSession(websocket)
+        await session.run()
+    except WebSocketDisconnect:
+        logger.info("WebSocket /ws/media disconnected")
+    except Exception:
+        logger.exception("WebSocket /ws/media error")
 
 
 if __name__ == "__main__":

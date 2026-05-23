@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import httpx
 import streamlit as st
 
-API_URL = os.getenv("FASTAPI_URL", "http://localhost:8000")
+API_URL = os.getenv("FASTAPI_URL", "http://127.0.0.1:8001")
 
 st.set_page_config(
     page_title="Voice AI — Appointment Reminder",
@@ -15,23 +15,52 @@ st.set_page_config(
 )
 
 st.title("📞 Voice AI Agent")
-st.caption("Appointment reminder — Custom pipeline (Twilio/Deepgram/Groq/Edge TTS) or Vapi")
+st.caption("Appointment reminder — Twilio → Deepgram → Groq → Edge TTS")
 
-try:
-    health = httpx.get(f"{API_URL}/health", timeout=5.0)
-    api_ok = health.status_code == 200
-except Exception:
-    api_ok = False
+def _check_api() -> tuple[bool, str]:
+    """Ping FastAPI backend (must be run_api.bat on port 8000)."""
+    try:
+        health = httpx.get(f"{API_URL}/health", timeout=3.0)
+        if health.status_code == 200:
+            return True, ""
+        return False, f"HTTP {health.status_code}"
+    except httpx.ConnectError:
+        return False, "Connection refused — is run_api.bat running?"
+    except httpx.ReadTimeout:
+        return False, "Timed out — API may be stuck; restart run_api.bat"
+    except Exception as exc:
+        return False, str(exc)
 
-col_status, col_config = st.columns(2)
+
+if "api_ok" not in st.session_state:
+    st.session_state.api_ok, st.session_state.api_error = _check_api()
+
+col_status, col_config, col_refresh = st.columns([1, 2, 1])
 with col_status:
-    st.metric("API", "Online" if api_ok else "Offline")
+    st.metric("API", "Online" if st.session_state.api_ok else "Offline")
 with col_config:
-    if api_ok:
-        cfg = httpx.get(f"{API_URL}/config/public", timeout=5.0).json()
-        st.caption(f"Webhook base: `{cfg.get('public_base_url')}`")
+    if st.session_state.api_ok:
+        try:
+            cfg = httpx.get(f"{API_URL}/config/public", timeout=3.0).json()
+            st.caption(f"Backend: `{API_URL}` · Webhook: `{cfg.get('public_base_url')}`")
+        except Exception:
+            st.caption(f"Backend: `{API_URL}`")
     else:
-        st.warning(f"Start the API first: `uvicorn app.main:app --reload` at {API_URL}")
+        st.warning(
+            f"**Cannot reach the API** at `{API_URL}`\n\n"
+            f"_{st.session_state.api_error}_\n\n"
+            "1. Open a **separate** terminal and run: `run_api.bat`\n"
+            "2. Wait for: `Connected to MongoDB` and `Application startup complete`\n"
+            "3. Click **Refresh** → or press **R** in Streamlit\n\n"
+            "Test in browser: [http://localhost:8000/health](http://localhost:8000/health) — should show "
+            '`{"status":"ok",...}`'
+        )
+with col_refresh:
+    if st.button("Refresh", help="Re-check API connection"):
+        st.session_state.api_ok, st.session_state.api_error = _check_api()
+        st.rerun()
+
+api_ok = st.session_state.api_ok
 
 tab_call, tab_appts, tab_history = st.tabs(["Place call", "Appointments", "Call history"])
 
@@ -73,27 +102,13 @@ with tab_appts:
 with tab_call:
     st.subheader("Trigger outbound call")
 
-    providers = []
+    provider = "custom"
     if api_ok:
         pr = httpx.get(f"{API_URL}/api/calls/providers", timeout=5.0)
         if pr.is_success:
-            providers = pr.json().get("providers", [])
-
-    provider_labels = {
-        "custom": "Custom pipeline (Twilio + Deepgram + Groq + Edge TTS)",
-        "vapi": "Vapi (managed voice AI)",
-    }
-    provider_options = [p["id"] for p in providers] or ["custom", "vapi"]
-    provider = st.radio(
-        "Voice provider",
-        options=provider_options,
-        format_func=lambda x: provider_labels.get(x, x),
-        horizontal=True,
-    )
-    if providers:
-        selected = next((p for p in providers if p["id"] == provider), None)
-        if selected and not selected.get("configured"):
-            st.warning(f"`{provider}` is not fully configured in .ENV — check API keys.")
+            custom = next((p for p in pr.json().get("providers", []) if p["id"] == "custom"), None)
+            if custom and not custom.get("configured"):
+                st.warning("Custom pipeline not fully configured — check Twilio, Deepgram, and Groq in `.env`.")
 
     scenario = st.selectbox(
         "Scenario",
@@ -140,8 +155,7 @@ with tab_call:
         else:
             body.update(custom)
 
-        label = "Vapi" if provider == "vapi" else "Twilio (custom pipeline)"
-        with st.spinner(f"Placing call via {label}…"):
+        with st.spinner("Placing call via Twilio…"):
             r = httpx.post(f"{API_URL}/api/calls/outbound", json=body, timeout=30.0)
         if r.is_success:
             data = r.json()
@@ -182,10 +196,9 @@ st.sidebar.markdown("### Setup checklist (venv)")
 st.sidebar.markdown(
     """
 1. `setup.bat` — install deps into `.\\venv`  
-2. `.env` / `.ENV` — Twilio and/or Vapi, Groq, MongoDB, Deepgram  
-3. [FFmpeg](https://ffmpeg.org/) on PATH (custom pipeline only)  
-4. `ngrok http 8000` → `PUBLIC_BASE_URL` (both providers need webhooks)  
-5. Vapi dashboard: link Groq + phone number; set Server URL → `/webhooks/vapi`  
-6. `run_api.bat` + `run_ui.bat`
+2. `.env` — Twilio, Deepgram, Groq, MongoDB  
+3. [FFmpeg](https://ffmpeg.org/) on PATH  
+4. `ngrok http 8000` → set `PUBLIC_BASE_URL`  
+5. `run_api.bat` + `run_ui.bat`
 """
 )
