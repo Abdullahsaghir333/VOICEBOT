@@ -1,0 +1,14 @@
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.ENV
+*.log
+audio_cache/
+.DS_Store
+.idea/
+.vscode/
+*.wav
+*.mp3
