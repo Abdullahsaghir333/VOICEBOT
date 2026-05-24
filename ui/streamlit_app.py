@@ -52,7 +52,7 @@ with col_config:
             "1. Open a **separate** terminal and run: `run_api.bat`\n"
             "2. Wait for: `Connected to MongoDB` and `Application startup complete`\n"
             "3. Click **Refresh** → or press **R** in Streamlit\n\n"
-            "Test in browser: [http://localhost:8000/health](http://localhost:8000/health) — should show "
+            "Test in browser: [http://localhost:8001/health](http://localhost:8001/health) — should show "
             '`{"status":"ok",...}`'
         )
 with col_refresh:
@@ -102,13 +102,10 @@ with tab_appts:
 with tab_call:
     st.subheader("Trigger outbound call")
 
-    provider = "custom"
     if api_ok:
-        pr = httpx.get(f"{API_URL}/api/calls/providers", timeout=5.0)
-        if pr.is_success:
-            custom = next((p for p in pr.json().get("providers", []) if p["id"] == "custom"), None)
-            if custom and not custom.get("configured"):
-                st.warning("Custom pipeline not fully configured — check Twilio, Deepgram, and Groq in `.env`.")
+        pr = httpx.get(f"{API_URL}/api/calls/status", timeout=5.0)
+        if pr.is_success and not pr.json().get("ready"):
+            st.warning("Voice pipeline not fully configured — check Twilio, Deepgram, and Groq in `.env`.")
 
     scenario = st.selectbox(
         "Scenario",
@@ -149,7 +146,7 @@ with tab_call:
     phone = st.text_input("Phone number to call (E.164)", "+15551234567")
 
     if st.button("Start call", type="primary", disabled=not api_ok):
-        body = {"phone_number": phone, "scenario": scenario, "provider": provider}
+        body = {"phone_number": phone, "scenario": scenario}
         if use_existing == "Existing appointment" and appointment_id:
             body["appointment_id"] = appointment_id
         else:
@@ -159,8 +156,8 @@ with tab_call:
             r = httpx.post(f"{API_URL}/api/calls/outbound", json=body, timeout=30.0)
         if r.is_success:
             data = r.json()
-            ref = data.get("vapi_call_id") or data.get("twilio_call_sid") or "—"
-            st.success(f"Call started — ID `{data['id']}` · provider `{data.get('provider')}` · ref `{ref}`")
+            sid = data.get("twilio_call_sid") or "—"
+            st.success(f"Call started — ID `{data['id']}` · Twilio SID `{sid}`")
             st.json(data)
         else:
             st.error(r.text)
@@ -172,9 +169,8 @@ with tab_history:
         if r.is_success:
             for call in r.json().get("calls", []):
                 with st.expander(
-                    f"{call['phone_number']} · {call.get('provider', 'custom')} · {call['status']} · {call.get('outcome') or '—'}"
+                    f"{call['phone_number']} · {call['status']} · {call.get('outcome') or '—'}"
                 ):
-                    st.write(f"**Provider:** {call.get('provider', 'custom')}")
                     st.write(f"**Scenario:** {call['scenario']}")
                     st.write(f"**Created:** {call['created_at']}")
                     if call.get("conversation"):
@@ -198,7 +194,7 @@ st.sidebar.markdown(
 1. `setup.bat` — install deps into `.\\venv`  
 2. `.env` — Twilio, Deepgram, Groq, MongoDB  
 3. [FFmpeg](https://ffmpeg.org/) on PATH  
-4. `ngrok http 8000` → set `PUBLIC_BASE_URL`  
+4. `ngrok http 8001` → set `PUBLIC_BASE_URL`  
 5. `run_api.bat` + `run_ui.bat`
 """
 )

@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",  # project secrets (see .env.custom.example)
+        env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -53,16 +53,8 @@ class Settings(BaseSettings):
     stt_endpointing_ms: int = Field(default=700, ge=300, le=2000)
     deepgram_model: str = "nova-2-phonecall"
 
-    # Edge TTS (custom Twilio pipeline only)
+    # Edge TTS
     edge_tts_voice: str = "en-US-JennyNeural"
-
-    # Vapi (managed voice AI platform — alternative outbound path)
-    vapi_api_key: str = ""
-    vapi_phone_number_id: str = ""
-    vapi_assistant_id: str = ""  # optional; if empty, uses transient assistant per call
-    vapi_server_url: str = ""  # optional; defaults to PUBLIC_BASE_URL/webhooks/vapi
-    vapi_voice_provider: str = "openai"
-    vapi_voice_id: str = "alloy"
 
     # App
     api_host: str = "0.0.0.0"
@@ -72,10 +64,6 @@ class Settings(BaseSettings):
     @property
     def deepgram_key(self) -> str:
         return self.deepgram_api_key or self.stt
-
-    @property
-    def vapi_configured(self) -> bool:
-        return bool(self.vapi_api_key and self.vapi_phone_number_id)
 
     @property
     def twilio_configured(self) -> bool:

@@ -21,7 +21,6 @@ class CallRepository:
         *,
         phone_number: str,
         scenario: str,
-        provider: Literal["custom", "vapi"] = "custom",
         appointment_id: str | None = None,
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -29,12 +28,10 @@ class CallRepository:
         doc = {
             "phone_number": phone_number,
             "scenario": scenario,
-            "provider": provider,
             "appointment_id": appointment_id,
             "context": context or {},
             "status": "queued",
             "twilio_call_sid": None,
-            "vapi_call_id": None,
             "conversation": [],
             "outcome": None,
             "created_at": now,
@@ -54,17 +51,12 @@ class CallRepository:
         doc = await self.collection.find_one({"twilio_call_sid": sid})
         return _serialize(doc) if doc else None
 
-    async def get_by_vapi_call_id(self, vapi_call_id: str) -> dict[str, Any] | None:
-        doc = await self.collection.find_one({"vapi_call_id": vapi_call_id})
-        return _serialize(doc) if doc else None
-
     async def update_status(
         self,
         call_id: str,
         status: Literal["queued", "ringing", "in_progress", "completed", "failed", "no_answer"],
         *,
         twilio_call_sid: str | None = None,
-        vapi_call_id: str | None = None,
         outcome: str | None = None,
     ) -> None:
         if not ObjectId.is_valid(call_id):
@@ -72,8 +64,6 @@ class CallRepository:
         payload: dict[str, Any] = {"status": status, "updated_at": datetime.utcnow()}
         if twilio_call_sid:
             payload["twilio_call_sid"] = twilio_call_sid
-        if vapi_call_id:
-            payload["vapi_call_id"] = vapi_call_id
         if outcome is not None:
             payload["outcome"] = outcome
         await self.collection.update_one({"_id": ObjectId(call_id)}, {"$set": payload})

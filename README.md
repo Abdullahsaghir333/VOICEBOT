@@ -1,209 +1,327 @@
-# Voice AI Agent — Appointment Reminder & Confirmation
+# Voice AI Agent — Appointment Reminder
 
-Outbound voice agent that places phone calls to remind patients about upcoming appointments and confirm, reschedule, or cancel them.
+Outbound voice agent that calls patients to remind them about upcoming appointments and handle **confirm**, **reschedule**, or **cancel** requests.
 
-**Two voice providers:**
-- **Custom pipeline** — Twilio → Deepgram → Groq → Edge TTS (you own each layer)
-- **Vapi** — managed voice AI with the same scenario; webhooks sync transcripts to MongoDB
+Built with a self-hosted real-time pipeline:
 
-**FastAPI** backend, **Streamlit** UI, **MongoDB** persistence.
+**Twilio** (telephony) → **Deepgram** (STT) → **Groq** (LLM) → **Edge TTS** (speech) → **Twilio** (playback)
 
-See **`IMPLEMENTATION.txt`** for the full architecture and implementation guide.
+Operators use a **Streamlit** dashboard; the **FastAPI** backend owns call logic, webhooks, and MongoDB persistence.
+
+---
+
+## Features
+
+- Outbound calls from the UI or REST API
+- Live conversation over Twilio Media Streams (WebSocket)
+- Appointment context injected into every LLM turn
+- Full transcripts and per-turn latency metrics in MongoDB
+- Barge-in (caller can interrupt the agent while it speaks)
+- Telephony-tuned STT (`nova-2-phonecall`) with turn debouncing
+- Extensible scenarios under `app/scenarios/`
+
+---
 
 ## Architecture
 
 ```mermaid
-flowchart LR
-    UI[Streamlit UI] --> API[FastAPI]
-    API --> MongoDB[(MongoDB)]
-    API --> Twilio[Twilio REST]
-    Twilio -->|PSTN call| Phone[Patient phone]
-    Twilio -->|Media Stream WS| WS["/ws/media"]
-    WS --> DG[Deepgram STT]
-    WS --> Groq[Groq LLM]
-    WS --> TTS[Edge TTS]
-    TTS --> WS
-    WS --> Twilio
+flowchart TB
+    subgraph operator
+        UI[Streamlit UI :8501]
+    end
+
+    subgraph backend["FastAPI :8001"]
+        API[REST + Webhooks]
+        WS["/ws/media"]
+        MS[MediaStreamSession]
+    end
+
+    subgraph data
+        DB[(MongoDB Atlas)]
+    end
+
+    subgraph telephony
+        TW[Twilio]
+        PH[Patient phone]
+    end
+
+    subgraph ai
+        DG[Deepgram STT]
+        GQ[Groq LLM]
+        TTS[Edge TTS + FFmpeg]
+    end
+
+    UI -->|HTTP| API
+    API --> DB
+    API -->|REST dial| TW
+    TW <-->|PSTN| PH
+    TW <-->|Media Stream| WS
+    WS --> MS
+    MS --> DG
+    MS --> GQ
+    MS --> TTS
+    MS --> DB
 ```
 
 ### Call flow
 
-1. User triggers an outbound call from the Streamlit UI (or `POST /api/calls/outbound`).
+1. Operator triggers `POST /api/calls/outbound` (or clicks **Start call** in Streamlit).
 2. FastAPI creates a call record in MongoDB and asks Twilio to dial the number.
-3. Twilio hits `POST /webhooks/twilio/voice`, which returns TwiML `<Connect><Stream>` to your public WebSocket URL.
-4. On connect, the agent speaks an opening line (Edge TTS → μ-law 8 kHz for Twilio).
-5. Caller audio streams to Deepgram (μ-law / 8 kHz). Final transcripts go to Groq with appointment context.
-6. Replies are synthesized and streamed back. Outcomes (`confirmed`, `reschedule_requested`, `cancelled`) update MongoDB.
+3. Twilio requests `POST /webhooks/twilio/voice`, which returns TwiML `<Connect><Stream>` to your public WebSocket URL.
+4. On connect, the agent plays an opening line (Edge TTS → μ-law 8 kHz).
+5. Caller audio streams to Deepgram; **final** transcripts are sent to Groq with appointment context.
+6. Replies are synthesized and streamed back. Outcomes update the appointment in MongoDB.
 
-### Design decisions
-
-| Area | Choice | Why |
-|------|--------|-----|
-| Scenario | Appointment reminder | Clear script, realistic evaluation, structured outcomes |
-| Persona | “Alex” @ HealthCare Plus | Professional, concise voice UX |
-| Custom media | Twilio Media Streams | Full self-built STT/LLM/TTS pipeline |
-| Vapi | Optional provider | Faster production path; same prompts & MongoDB |
-| LLM | Groq `llama-3.3-70b-versatile` | Fast, low-latency (custom + Vapi transient assistant) |
-| TTS | Edge TTS (custom) / Vapi voice (vapi) | Custom uses free Edge TTS; Vapi uses configured voice |
-| State | MongoDB | Appointments, calls, full transcripts for review |
-| Extensibility | `app/scenarios/` | Add scenarios without changing core stream logic |
+---
 
 ## Prerequisites
 
-- Python 3.11+
-- [FFmpeg](https://ffmpeg.org/download.html) on PATH (required by `pydub` for MP3 → μ-law)
-- [ngrok](https://ngrok.com/) (or similar) to expose localhost to Twilio
-- Accounts: Twilio and/or [Vapi](https://vapi.ai), Deepgram, Groq, MongoDB Atlas
+| Requirement | Purpose |
+|-------------|---------|
+| **Python 3.11+** | Runtime |
+| **FFmpeg** on `PATH` | Converts Edge TTS MP3 → μ-law for Twilio |
+| **ngrok** (local dev) | Public HTTPS + WebSocket for Twilio |
+| **Twilio** account | Outbound calls + Media Streams |
+| **Deepgram** API key | Speech-to-text |
+| **Groq** API key | LLM |
+| **MongoDB Atlas** | Appointments, calls, transcripts |
 
-## Setup
+---
 
-This project uses a **local virtual environment** at `venv/`. All commands below use that venv — you do not need a global `pip install`.
+## Quick start (Windows)
 
-### 1. Install into `venv` (Windows)
-
-**Option A — scripts (recommended):**
+### 1. Install dependencies
 
 ```powershell
 cd c:\Users\abdul\MYDOCUMENTS\VOICEBOT
 .\setup.bat
 ```
 
-**Option B — manual:**
+This creates `venv\` and installs packages from `requirements.txt`.
 
-```powershell
-cd c:\Users\abdul\MYDOCUMENTS\VOICEBOT
-python -m venv venv          # skip if venv already exists
-.\venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-```
-
-`run_api.bat` and `run_ui.bat` call `venv\Scripts\python.exe` directly, so they work even if the venv is not activated.
-
-**Cursor / VS Code:** open the project folder; the workspace points the Python interpreter to `venv\Scripts\python.exe` (see `.vscode/settings.json`).
-
-### 2. Environment
-
-Use either `.env` or `.ENV` in the project root (both are loaded):
+### 2. Configure environment
 
 ```powershell
 copy .env.example .env
 ```
 
-Edit with your credentials. **Never commit secrets.**
+Edit `.env` with your credentials. The app also reads `.ENV` if you use that filename on Windows.
 
-Your existing `.ENV` keys are supported: `STT`, `TWILLIO_*` (typo alias), or standard `TWILIO_*` / `DEEPGRAM_API_KEY`.
+**Never commit real secrets.**
 
-| Variable | Description |
-|----------|-------------|
-| `PUBLIC_BASE_URL` | Public HTTPS base URL (ngrok), e.g. `https://abc123.ngrok-free.app` |
-| `MONGODB_URI` | MongoDB connection string |
-| `TWILIO_*` | Account SID, auth token, outbound caller ID |
-| `DEEPGRAM_API_KEY` | Deepgram API key |
-| `GROQ_API_KEY` | Groq API key |
-| `VAPI_API_KEY` | Vapi private key (if using Vapi provider) |
-| `VAPI_PHONE_NUMBER_ID` | Phone number ID from Vapi dashboard |
+### 3. Expose the API to Twilio
 
-### 3. Expose the API
+Twilio must reach your machine for HTTP webhooks and the media WebSocket.
 
-Twilio must reach your machine for webhooks and WebSocket media:
-
-```bash
-ngrok http 8000
+```powershell
+ngrok http 8001
 ```
 
-Set `PUBLIC_BASE_URL` in `.env` to the ngrok **https** URL (no trailing slash).
+Copy the **https** URL (no trailing slash) into `.env`:
 
-### 4. Run services (from project root, uses `venv`)
+```env
+PUBLIC_BASE_URL=https://abc123.ngrok-free.app
+```
 
-Terminal 1 — API:
+### 4. Run the services
+
+**Terminal 1 — API:**
 
 ```powershell
 .\run_api.bat
 ```
 
-Or with venv activated:
+Wait for `Connected to MongoDB` and `Application startup complete`.
 
-```powershell
-.\venv\Scripts\Activate.ps1
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Terminal 2 — UI:
+**Terminal 2 — UI:**
 
 ```powershell
 .\run_ui.bat
 ```
 
-Or:
+Open **http://localhost:8501**
 
-```powershell
-.\venv\Scripts\Activate.ps1
-python -m streamlit run ui/streamlit_app.py
-```
+### 5. Place a test call
 
-Open http://localhost:8501
+1. Create an appointment on the **Appointments** tab.
+2. On **Place call**, select the appointment and enter an E.164 number (e.g. `+15551234567`).
+3. Click **Start call**.
+4. For **Twilio trial** accounts: verify the destination number in the Twilio console; answer the call and press **1** when prompted.
 
-### 5. Twilio
+---
 
-- Buy/configure a voice-capable number.
-- No console TwiML needed — webhooks are set per call from the API.
-- For trial accounts, verify destination numbers.
+## Environment variables
 
-## API overview
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PUBLIC_BASE_URL` | Yes | Public HTTPS base URL (ngrok or production domain) |
+| `MONGODB_URI` | Yes | MongoDB connection string |
+| `MONGODB_DB_NAME` | No | Database name (default `voicebot`) |
+| `TWILIO_ACCOUNT_SID` | Yes | Twilio account SID |
+| `TWILIO_AUTH_TOKEN` | Yes | Twilio auth token |
+| `TWILIO_PHONE_NUMBER` | Yes | Outbound caller ID (E.164) |
+| `TWILIO_CALL_TIMEOUT` | No | Ring timeout in seconds (default `60`) |
+| `DEEPGRAM_API_KEY` | Yes | Deepgram key (`STT=` alias also supported) |
+| `DEEPGRAM_MODEL` | No | Default `nova-2-phonecall` |
+| `STT_TURN_DEBOUNCE_MS` | No | Wait after last STT final before LLM (default `1100`) |
+| `STT_ENDPOINTING_MS` | No | Deepgram endpointing (default `700`) |
+| `GROQ_API_KEY` | Yes | Groq API key |
+| `GROQ_MODEL` | No | Default `llama-3.3-70b-versatile` |
+| `EDGE_TTS_VOICE` | No | Default `en-US-JennyNeural` |
+| `API_PORT` | No | Default `8001` (see `run_api.bat`) |
+| `FASTAPI_URL` | No | URL Streamlit uses (default `http://127.0.0.1:8001`) |
+
+---
+
+## API reference
+
+Base URL: `http://127.0.0.1:8001` (local)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
+| `GET` | `/health/tts` | Test Edge TTS + FFmpeg |
+| `GET` | `/config/public` | Public URLs and config flags |
+| `GET` | `/debug/stream` | WebSocket URL Twilio should use |
 | `POST` | `/api/appointments` | Create appointment |
 | `GET` | `/api/appointments` | List appointments |
-| `GET` | `/api/calls/providers` | List voice providers (custom / vapi) |
-| `POST` | `/api/calls/outbound` | Place outbound call (`provider`: custom \| vapi) |
+| `GET` | `/api/appointments/{id}` | Get appointment |
+| `PATCH` | `/api/appointments/{id}` | Update appointment |
+| `GET` | `/api/calls/status` | Pipeline readiness |
+| `POST` | `/api/calls/outbound` | Place outbound call |
 | `GET` | `/api/calls` | Recent calls + transcripts |
+| `GET` | `/api/calls/{id}` | Single call |
 | `POST` | `/webhooks/twilio/voice` | Twilio TwiML (internal) |
-| `WS` | `/ws/media` | Twilio Media Stream (custom only) |
-| `POST` | `/webhooks/vapi` | Vapi server messages (vapi only) |
+| `POST` | `/webhooks/twilio/status` | Twilio status callbacks |
+| `WS` | `/ws/media` | Twilio Media Stream |
 
 ### Example: outbound call
 
 ```bash
-curl -X POST http://localhost:8000/api/calls/outbound \
+curl -X POST http://127.0.0.1:8001/api/calls/outbound \
   -H "Content-Type: application/json" \
-  -d "{\"phone_number\": \"+15551234567\", \"scenario\": \"appointment_reminder\", \"patient_name\": \"Jane Doe\"}"
+  -d "{
+    \"phone_number\": \"+15551234567\",
+    \"scenario\": \"appointment_reminder\",
+    \"patient_name\": \"Jane Doe\",
+    \"provider_name\": \"Dr. Smith\",
+    \"clinic_name\": \"HealthCare Plus Clinic\",
+    \"clinic_address\": \"123 Wellness Ave\",
+    \"appointment_datetime\": \"2026-05-25T15:30:00\"
+  }"
 ```
+
+Interactive docs: **http://127.0.0.1:8001/docs**
+
+---
 
 ## Project structure
 
 ```
-app/
-  main.py                 # FastAPI app + WebSocket
-  config.py               # Settings
-  api/routes/             # REST + Twilio webhooks
-  services/               # Twilio, Deepgram bridge, Groq, TTS, media stream
-  scenarios/              # Appointment reminder script & prompts
-  repositories/           # MongoDB access
-  schemas/                # Pydantic models
-ui/
-  streamlit_app.py        # Operator UI
+VOICEBOT/
+├── app/
+│   ├── main.py                 # FastAPI app + /ws/media
+│   ├── config.py               # Settings from .env
+│   ├── api/routes/
+│   │   ├── appointments.py
+│   │   ├── calls.py
+│   │   └── webhooks.py         # Twilio TwiML + status
+│   ├── services/
+│   │   ├── media_stream.py     # Real-time voice pipeline
+│   │   ├── deepgram_stt.py
+│   │   ├── groq_service.py
+│   │   ├── tts_service.py
+│   │   ├── twilio_service.py
+│   │   └── stt_filters.py
+│   ├── scenarios/
+│   │   └── appointment_reminder.py
+│   ├── repositories/           # MongoDB access
+│   └── schemas/                # Pydantic models
+├── ui/
+│   └── streamlit_app.py
+├── run_api.bat
+├── run_ui.bat
+├── setup.bat
+├── requirements.txt
+└── .env.example
 ```
+
+---
+
+## Deployment
+
+Deploy **one backend** (FastAPI). Optionally deploy **Streamlit** for operators.
+
+| Component | Deploy? |
+|-----------|---------|
+| FastAPI (`uvicorn app.main:app`) | **Required** |
+| Streamlit UI | Optional (internal tool) |
+| MongoDB Atlas | Already cloud — configure URI only |
+| Twilio, Deepgram, Groq | API keys only — no deploy |
+| Edge TTS | Runs inside your FastAPI process (needs outbound internet) |
+| ngrok | Dev only — use a real HTTPS domain in production |
+
+**Production requirements:**
+
+- Public **HTTPS** URL → `PUBLIC_BASE_URL`
+- **WebSocket** support for `/ws/media`
+- **FFmpeg** installed on the server
+- All secrets in environment variables (not in git)
+
+Example process:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+
+Good hosting options: VPS (DigitalOcean, AWS EC2, Azure VM), Railway, Render, or Fly.io — verify WebSocket support on your plan.
+
+---
 
 ## Adding scenarios
 
-1. Add `app/scenarios/your_scenario.py` with `SCENARIO_ID`, `SYSTEM_PROMPT`, `opening_line()`, `detect_outcome()`.
-2. Register scenario id in the UI select box.
-3. Extend `GroqConversationService` to load the new system prompt.
+1. Add `app/scenarios/your_scenario.py` with:
+   - `SCENARIO_ID`
+   - `SYSTEM_PROMPT`
+   - `build_context_block(context)`
+   - `opening_line(context)`
+   - `detect_outcome(user_text, assistant_text)`
+2. Register the scenario id in `ui/streamlit_app.py`.
+3. Extend `GroqConversationService` to load the new prompt.
+
+---
 
 ## Troubleshooting
 
-| Issue | Fix |
-|-------|-----|
-| Call connects but no agent voice | Check FFmpeg; inspect API logs for TTS errors |
-| Twilio never connects stream | `PUBLIC_BASE_URL` must be HTTPS ngrok URL |
-| No transcription | Verify `DEEPGRAM_API_KEY`; check Deepgram quota |
-| `API Offline` in UI | Start uvicorn; set `FASTAPI_URL` if not default |
+| Symptom | What to check |
+|---------|----------------|
+| **API Offline** in UI | Run `run_api.bat`; set `FASTAPI_URL=http://127.0.0.1:8001` |
+| Call connects, no agent voice | `GET /health/tts` — install FFmpeg on PATH |
+| Twilio never opens media stream | `PUBLIC_BASE_URL` must be HTTPS; ngrok must tunnel **8001** |
+| No transcription | `DEEPGRAM_API_KEY`; Deepgram quota; API logs for Deepgram errors |
+| Instant `busy` status | Carrier/trial limits (especially international); verify destination on trial |
+| Garbled STT | Phone line quality; try speaking clearly; check `STT normalized` in logs |
+| Slow replies | LLM is usually fast; TTS (~1.5–2 s) dominates — prompts are kept short |
 
-## Security note
+**Verify pipeline:**
 
-Rotate any credentials that were shared in chat or committed by mistake. Use `.env` only locally and keep `.gitignore` excluding secrets.
+```powershell
+curl http://127.0.0.1:8001/api/calls/status
+curl http://127.0.0.1:8001/health/tts
+```
+
+During a live call, ngrok should show a **WebSocket** `GET /ws/media` with status **101**.
+
+---
+
+## Security
+
+- Keep `.env` / `.ENV` out of version control (see `.gitignore`).
+- Rotate any credentials that were exposed in chat or commits.
+- Use MongoDB Atlas IP allowlisting or VPC peering in production.
+- Restrict Streamlit to trusted networks if deployed.
+
+---
 
 ## License
 

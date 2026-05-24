@@ -5,7 +5,6 @@ from app.repositories.calls import CallRepository
 from app.schemas.call import CallListResponse, CallResponse, ConversationTurn, OutboundCallRequest
 from app.services.call_context import resolve_call_context
 from app.services.twilio_service import TwilioService
-from app.services.vapi_service import VapiService
 
 router = APIRouter(prefix="/calls", tags=["calls"])
 call_repo = CallRepository()
@@ -17,10 +16,8 @@ def _to_response(doc: dict) -> CallResponse:
         id=doc["id"],
         phone_number=doc["phone_number"],
         scenario=doc["scenario"],
-        provider=doc.get("provider", "custom"),
         status=doc["status"],
         twilio_call_sid=doc.get("twilio_call_sid"),
-        vapi_call_id=doc.get("vapi_call_id"),
         appointment_id=doc.get("appointment_id"),
         conversation=turns,
         outcome=doc.get("outcome"),
@@ -29,27 +26,20 @@ def _to_response(doc: dict) -> CallResponse:
     )
 
 
-@router.get("/providers")
-async def list_providers():
+@router.get("/status")
+async def pipeline_status():
+    """Whether the voice pipeline is ready to place calls."""
     settings = get_settings()
     return {
-        "providers": [
-            {
-                "id": "custom",
-                "name": "Custom pipeline",
-                "description": "Twilio telephony + Deepgram STT + Groq LLM + Edge TTS",
-                "configured": settings.twilio_configured,
-                "requires_ngrok": True,
-            },
-            {
-                "id": "vapi",
-                "name": "Vapi",
-                "description": "Vapi-managed voice stack (Groq + Deepgram configured in assistant)",
-                "configured": settings.vapi_configured,
-                "requires_ngrok": True,
-                "webhook_path": "/webhooks/vapi",
-            },
-        ]
+        "pipeline": "Twilio + Deepgram + Groq + Edge TTS",
+        "twilio_configured": settings.twilio_configured,
+        "deepgram_configured": bool(settings.deepgram_key),
+        "groq_configured": bool(settings.groq_api_key),
+        "public_base_url": settings.public_base_url,
+        "media_stream_ws_url": settings.media_stream_ws_url,
+        "ready": settings.twilio_configured
+        and bool(settings.deepgram_key)
+        and bool(settings.groq_api_key),
     }
 
 
@@ -57,10 +47,12 @@ async def list_providers():
 async def trigger_outbound_call(body: OutboundCallRequest):
     settings = get_settings()
 
-    if body.provider == "custom" and not settings.twilio_configured:
-        raise HTTPException(status_code=503, detail="Twilio is not configured for custom pipeline")
-    if body.provider == "vapi" and not settings.vapi_configured:
-        raise HTTPException(status_code=503, detail="Vapi is not configured (VAPI_API_KEY, VAPI_PHONE_NUMBER_ID)")
+    if not settings.twilio_configured:
+        raise HTTPException(status_code=503, detail="Twilio is not configured (TWILIO_ACCOUNT_SID, TWILIO_PHONE_NUMBER)")
+    if not settings.deepgram_key:
+        raise HTTPException(status_code=503, detail="Deepgram is not configured (DEEPGRAM_API_KEY)")
+    if not settings.groq_api_key:
+        raise HTTPException(status_code=503, detail="Groq is not configured (GROQ_API_KEY)")
 
     try:
         appointment_id, context = await resolve_call_context(body)
@@ -70,27 +62,15 @@ async def trigger_outbound_call(body: OutboundCallRequest):
     call_doc = await call_repo.create(
         phone_number=body.phone_number,
         scenario=body.scenario,
-        provider=body.provider,
         appointment_id=appointment_id,
         context=context,
     )
 
     try:
-        if body.provider == "vapi":
-            vapi_id = await VapiService().create_outbound_call(
-                phone_number=body.phone_number,
-                call_id=call_doc["id"],
-                scenario=body.scenario,
-                context=context,
-            )
-            await call_repo.update_status(call_doc["id"], "ringing", vapi_call_id=vapi_id)
-            call_doc["vapi_call_id"] = vapi_id
-            call_doc["status"] = "ringing"
-        else:
-            sid = TwilioService().place_outbound_call(body.phone_number, call_doc["id"])
-            await call_repo.update_status(call_doc["id"], "ringing", twilio_call_sid=sid)
-            call_doc["twilio_call_sid"] = sid
-            call_doc["status"] = "ringing"
+        sid = TwilioService().place_outbound_call(body.phone_number, call_doc["id"])
+        await call_repo.update_status(call_doc["id"], "ringing", twilio_call_sid=sid)
+        call_doc["twilio_call_sid"] = sid
+        call_doc["status"] = "ringing"
     except Exception as exc:
         await call_repo.update_status(call_doc["id"], "failed", outcome=str(exc))
         raise HTTPException(status_code=502, detail=f"Failed to place call: {exc}") from exc

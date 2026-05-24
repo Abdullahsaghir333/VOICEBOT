@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import appointments, calls, vapi_webhooks, webhooks
+from app.api.routes import appointments, calls, webhooks
 from app.config import get_settings
 from app.db.mongodb import close_mongodb, get_database
 from app.services.media_stream import MediaStreamSession
@@ -31,7 +31,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Voice AI Agent",
-    description="Outbound appointment reminder — Custom pipeline (Twilio/Deepgram/Groq/Edge TTS) or Vapi",
+    description="Outbound appointment reminder — Twilio, Deepgram, Groq, Edge TTS",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -47,9 +47,6 @@ app.add_middleware(
 app.include_router(appointments.router, prefix="/api")
 app.include_router(calls.router, prefix="/api")
 app.include_router(webhooks.router)
-app.include_router(vapi_webhooks.router)
-
-
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.perf_counter()
@@ -93,13 +90,10 @@ async def public_config():
     return {
         "public_base_url": settings.public_base_url,
         "media_stream_ws_url": settings.media_stream_ws_url,
-        "vapi_webhook_url": settings.vapi_server_url
-        or f"{settings.public_base_url.rstrip('/')}/webhooks/vapi",
         "scenario": "appointment_reminder",
-        "providers": {
-            "custom": settings.twilio_configured,
-            "vapi": settings.vapi_configured,
-        },
+        "twilio_configured": settings.twilio_configured,
+        "deepgram_configured": bool(settings.deepgram_key),
+        "groq_configured": bool(settings.groq_api_key),
     }
 
 
