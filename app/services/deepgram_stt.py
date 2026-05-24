@@ -6,6 +6,7 @@ from app.config import get_settings
 
 
 def build_listen_url() -> str:
+    settings = get_settings()
     """
     WebSocket listen URL tuned for voice-bot use:
     - interim_results=false: never act on partial transcripts
@@ -16,13 +17,13 @@ def build_listen_url() -> str:
         "encoding": "mulaw",
         "sample_rate": "8000",
         "channels": "1",
-        "model": "nova-2",
-        "language": "en",
+        "model": settings.deepgram_model,
+        "language": "en-US",
         # Final transcripts only for LLM (see parse_final_transcript). Do not set
         # utterance_end_ms here — Deepgram returns HTTP 400 unless interim_results=true.
         "interim_results": "false",
         "vad_events": "true",
-        "endpointing": "400",
+        "endpointing": str(settings.stt_endpointing_ms),
         "punctuate": "true",
         "smart_format": "true",
     }

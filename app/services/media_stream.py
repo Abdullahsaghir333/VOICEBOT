@@ -26,10 +26,19 @@ from app.services.deepgram_stt import (
     parse_final_transcript,
 )
 from app.services.groq_service import GroqConversationService
+from app.services.stt_filters import (
+    is_meaningful_transcript,
+    normalize_phone_transcript,
+    pick_best_transcript,
+)
 from app.services.turn_metrics import TurnMetrics
 from app.services.tts_service import chunk_mulaw, synthesize_mulaw
 
 logger = logging.getLogger(__name__)
+
+# Ignore SpeechStarted (echo) for this long after TTS begins playing
+BARGE_IN_LOCKOUT_SECONDS = 1.5
+TTS_CHUNK_BATCH_SIZE = 12
 
 
 class MediaStreamSession:
@@ -57,6 +66,12 @@ class MediaStreamSession:
         # Avoid VAD false barge-in during opening greeting (kills TTS before you hear it).
         self._barge_in_enabled = False
 
+        self._stt_fragments: list[str] = []
+        self._debounce_task: asyncio.Task | None = None
+        self._queued_user_turn: str | None = None
+        self._last_user_turn_normalized: str | None = None
+        self._barge_in_unlock_task: asyncio.Task | None = None
+
         self._call_repo = CallRepository()
         self._appt_repo = AppointmentRepository()
         self._llm = GroqConversationService()
@@ -72,8 +87,10 @@ class MediaStreamSession:
         finally:
             self._stopped = True
             self._restart_deepgram.set()
-            if self._pipeline_task and not self._pipeline_task.done():
-                self._pipeline_task.cancel()
+            if self._debounce_task and not self._debounce_task.done():
+                self._debounce_task.cancel()
+            self._cancel_barge_in_unlock_task()
+            await self._cancel_pipeline_safe()
             if self._deepgram_task:
                 self._deepgram_task.cancel()
                 await asyncio.gather(self._deepgram_task, return_exceptions=True)
@@ -190,25 +207,35 @@ class MediaStreamSession:
         if not transcript:
             return
 
-        if self._processing_turn:
-            logger.debug("Ignoring overlapping final transcript during pipeline")
+        if not is_meaningful_transcript(transcript):
+            logger.debug("Skipping low-value STT fragment call_id=%s: %s", self.call_id, transcript)
             return
 
-        await self._on_user_speech(transcript)
+        self._stt_fragments.append(transcript)
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        self._debounce_task = asyncio.create_task(self._flush_user_turn_after_debounce())
 
     async def _handle_barge_in(self) -> None:
         logger.info("Barge-in detected call_id=%s", self.call_id)
+        self._barge_in_enabled = False
         self._interrupt.set()
+        self._stt_fragments.clear()
+        self._cancel_barge_in_unlock_task()
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
         await self._clear_twilio_playback()
 
-        if self._pipeline_task and not self._pipeline_task.done():
-            self._pipeline_task.cancel()
-            await asyncio.gather(self._pipeline_task, return_exceptions=True)
-            self._pipeline_task = None
+        asyncio.create_task(self._cancel_pipeline_safe())
 
         self._agent_speaking = False
         self._processing_turn = False
         self._restart_deepgram.set()
+
+    def _cancel_barge_in_unlock_task(self) -> None:
+        if self._barge_in_unlock_task and not self._barge_in_unlock_task.done():
+            self._barge_in_unlock_task.cancel()
+        self._barge_in_unlock_task = None
 
     async def _clear_twilio_playback(self) -> None:
         if not self.stream_sid:
@@ -220,10 +247,103 @@ class MediaStreamSession:
         except Exception:
             logger.exception("Failed to send Twilio clear event")
 
-    async def _on_user_speech(self, text: str) -> None:
+    def _normalize_user_text(self, text: str) -> str:
+        return normalize_phone_transcript(text, self.context.get("patient_name"))
+
+    def _turn_key(self, text: str) -> str:
+        return self._normalize_user_text(text).lower().strip()
+
+    def _is_duplicate_user_turn(self, text: str) -> bool:
+        key = self._turn_key(text)
+        if not key:
+            return True
+        if self._last_user_turn_normalized == key:
+            return True
+        if self._queued_user_turn and key in self._turn_key(self._queued_user_turn):
+            return True
+        return False
+
+    def _queue_user_turn(self, text: str) -> None:
+        text = self._normalize_user_text(text)
+        if self._is_duplicate_user_turn(text):
+            return
+        if self._queued_user_turn:
+            merged = f"{self._queued_user_turn} {text}".strip()
+            if self._turn_key(merged) == self._turn_key(self._queued_user_turn):
+                return
+            self._queued_user_turn = merged
+        else:
+            self._queued_user_turn = text
+        logger.debug("Queued user turn while busy call_id=%s: %s", self.call_id, self._queued_user_turn)
+
+    async def _flush_user_turn_after_debounce(self) -> None:
+        """Wait for end of utterance, then run one LLM+TTS turn on the best final."""
+        delay = self._settings.stt_turn_debounce_ms / 1000.0
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        fragments = self._stt_fragments
+        self._stt_fragments = []
+        raw = pick_best_transcript(fragments)
+        if not raw:
+            return
+
+        text = self._normalize_user_text(raw)
+        if text != raw:
+            logger.info("STT normalized call_id=%s: %r -> %r", self.call_id, raw, text)
+
+        if self._is_duplicate_user_turn(text):
+            logger.debug("Skipping duplicate debounced turn call_id=%s: %s", self.call_id, text)
+            return
+
+        if self._processing_turn:
+            self._queue_user_turn(text)
+            return
+
+        self._schedule_user_turn(text)
+
+    async def _cancel_pipeline_task(self) -> None:
+        await self._cancel_pipeline_safe()
+
+    async def _cancel_pipeline_safe(self) -> None:
+        """Cancel pipeline from outside the pipeline task — avoids RecursionError."""
+        task = self._pipeline_task
+        if not task or task.done():
+            return
+        if task is asyncio.current_task():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        if self._pipeline_task is task:
+            self._pipeline_task = None
+
+    def _schedule_user_turn(self, text: str) -> None:
         if not self.call_id:
             return
+        text = self._normalize_user_text(text)
+        key = self._turn_key(text)
+        if self._last_user_turn_normalized == key:
+            logger.debug("Skipping duplicate user turn call_id=%s", self.call_id)
+            return
+        self._last_user_turn_normalized = key
         self._pipeline_task = asyncio.create_task(self._run_turn_pipeline(text))
+
+    def _schedule_queued_turn_if_any(self) -> None:
+        text = self._queued_user_turn
+        if not text:
+            return
+        self._queued_user_turn = None
+        logger.info("Running queued user turn call_id=%s: %s", self.call_id, text)
+        self._schedule_user_turn(text)
+
+    async def _maybe_run_queued_turn(self) -> None:
+        if self._queued_user_turn and not self._processing_turn:
+            self._schedule_queued_turn_if_any()
 
     async def _run_turn_pipeline(self, user_text: str, *, is_greeting: bool = False) -> None:
         if is_greeting:
@@ -246,8 +366,6 @@ class MediaStreamSession:
                     )
             except Exception:
                 logger.exception("Greeting playback error call_id=%s", self.call_id)
-            finally:
-                self._barge_in_enabled = True
             return
 
         self._processing_turn = True
@@ -319,38 +437,57 @@ class MediaStreamSession:
         finally:
             self._processing_turn = False
             self._interrupt.clear()
+            await self._maybe_run_queued_turn()
+
+    async def _enable_barge_in_after_delay(self, delay: float) -> None:
+        """Enable barge-in after playback started (avoids echo on SpeechStarted)."""
+        try:
+            await asyncio.sleep(delay)
+            if not self._interrupt.is_set() and not self._stopped:
+                self._barge_in_enabled = True
+                logger.debug("Barge-in enabled call_id=%s", self.call_id)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._barge_in_unlock_task = None
 
     async def _speak(self, text: str, *, save_to_history: bool = False) -> None:
         if not text or not self.stream_sid:
             return
 
         self._agent_speaking = True
+        self._interrupt.clear()
+        self._barge_in_enabled = False
+        self._cancel_barge_in_unlock_task()
+
         try:
             audio = await synthesize_mulaw(text)
-            logger.debug(
-                "TTS ready call_id=%s bytes=%d",
-                self.call_id,
-                len(audio),
-            )
+            logger.debug("TTS ready call_id=%s bytes=%d", self.call_id, len(audio))
             if self._interrupt.is_set():
                 await self._clear_twilio_playback()
                 return
 
-            for frame in chunk_mulaw(audio):
+            self._barge_in_unlock_task = asyncio.create_task(
+                self._enable_barge_in_after_delay(BARGE_IN_LOCKOUT_SECONDS)
+            )
+
+            chunks = chunk_mulaw(audio)
+            for i in range(0, len(chunks), TTS_CHUNK_BATCH_SIZE):
                 if self._interrupt.is_set():
                     await self._clear_twilio_playback()
                     return
-                payload = base64.b64encode(frame).decode("ascii")
-                await self.twilio_ws.send_text(
-                    json.dumps(
-                        {
-                            "event": "media",
-                            "streamSid": self.stream_sid,
-                            "media": {"payload": payload},
-                        }
+                for frame in chunks[i : i + TTS_CHUNK_BATCH_SIZE]:
+                    payload = base64.b64encode(frame).decode("ascii")
+                    await self.twilio_ws.send_text(
+                        json.dumps(
+                            {
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {"payload": payload},
+                            }
+                        )
                     )
-                )
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.016)
 
             if save_to_history and not self._interrupt.is_set():
                 self.history.append({"role": "assistant", "content": text})

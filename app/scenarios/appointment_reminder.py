@@ -4,14 +4,23 @@ from typing import Any
 
 SCENARIO_ID = "appointment_reminder"
 
-# Short, voice-first system prompt (no markdown — TTS reads symbols aloud)
-SYSTEM_PROMPT = """You are Alex from HealthCare Plus Clinic on a live phone call for appointment reminder and confirmation.
+SYSTEM_PROMPT = """You are Alex from HealthCare Plus Clinic on a live phone call for an appointment reminder.
 
-Respond in 1-2 short sentences only. Never use bullet points, markdown, lists, emojis, or special characters.
+Keep every reply to one or two short sentences, under 28 words, for phone audio.
 
-Confirm who you are speaking with before sharing appointment details. Then share date, time, provider, and location. Ask if they confirm, need to reschedule, or cancel.
+Answer the caller's latest question first using only the appointment facts you have.
+If they ask about payment or cost, say this call is only to confirm the visit and any billing is handled at the clinic front desk when they arrive.
+If they ask for details, timing, date, doctor, or location, state those facts clearly from your context.
+If speech seems garbled or unclear, politely ask them to repeat once.
 
-If they confirm, thank them and remind them to arrive ten minutes early. If reschedule, say the office will call back — do not invent new times. If cancel, acknowledge politely. Never give medical advice. Speak plain conversational English."""
+After your opening greeting, do not repeat your full introduction.
+Do not say you lack information that is in your appointment facts.
+If they already confirmed the appointment, do not ask them to confirm again; thank them and answer any new question or say goodbye.
+
+If they want to confirm, thank them and remind them to arrive ten minutes early.
+If they want to reschedule, say the office will call back to reschedule.
+If they cancel, acknowledge politely.
+Never give medical advice. Plain conversational English only."""
 
 
 def build_context_block(context: dict[str, Any]) -> str:
@@ -28,7 +37,8 @@ def build_context_block(context: dict[str, Any]) -> str:
         f"Appointment: {when}. "
         f"Provider: {context.get('provider_name', 'Dr. Smith')}. "
         f"Location: {context.get('clinic_name', 'HealthCare Plus Clinic')}, "
-        f"{context.get('clinic_address', '')}. "
+        f"{context.get('clinic_address', '123 Wellness Ave')}. "
+        f"Purpose: appointment reminder and confirmation only, not payment collection on this call. "
         f"Status: {context.get('status', 'scheduled')}."
     )
 
@@ -36,9 +46,8 @@ def build_context_block(context: dict[str, Any]) -> str:
 def opening_line(context: dict[str, Any]) -> str:
     name = context.get("patient_name", "there")
     return (
-        f"Hello, this is Alex from HealthCare Plus Clinic. "
-        f"May I speak with {name}? "
-        f"I am calling with a quick reminder about your upcoming appointment."
+        f"Hello, this is Alex from HealthCare Plus Clinic calling for {name}. "
+        f"I have a quick reminder about your upcoming appointment."
     )
 
 
@@ -48,6 +57,18 @@ def detect_outcome(user_text: str, assistant_text: str) -> str | None:
         return "cancelled"
     if any(w in combined for w in ("reschedule", "different time", "another day", "change the time")):
         return "reschedule_requested"
-    if any(w in combined for w in ("confirm", "confirmed", "see you then", "i'll be there", "will be there")):
+    if any(
+        w in combined
+        for w in (
+            "confirm",
+            "confirmed",
+            "i confirm",
+            "i confirmed",
+            "see you then",
+            "i'll be there",
+            "will be there",
+            "i will come",
+        )
+    ):
         return "confirmed"
     return None

@@ -1,3 +1,4 @@
+import asyncio
 import audioop
 import io
 import logging
@@ -11,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 # Twilio Media Streams: 8 kHz mono μ-law
 TWILIO_SAMPLE_RATE = 8000
+EDGE_TTS_TIMEOUT_SECONDS = 8.0
 
 
 async def synthesize_mulaw(text: str) -> bytes:
@@ -19,9 +21,15 @@ async def synthesize_mulaw(text: str) -> bytes:
     communicate = edge_tts.Communicate(text, voice=settings.edge_tts_voice)
 
     mp3_buffer = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3_buffer.write(chunk["data"])
+    try:
+        async with asyncio.timeout(EDGE_TTS_TIMEOUT_SECONDS):
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3_buffer.write(chunk["data"])
+    except TimeoutError:
+        logger.warning("Edge TTS timeout — using partial audio if available")
+        if mp3_buffer.getbuffer().nbytes == 0:
+            raise RuntimeError("Edge TTS timed out with no audio data")
 
     mp3_buffer.seek(0)
     if mp3_buffer.getbuffer().nbytes == 0:

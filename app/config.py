@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
 
+    # Live STT turn control (custom media stream)
+    stt_turn_debounce_ms: int = Field(default=1100, ge=300, le=3000)
+    stt_endpointing_ms: int = Field(default=700, ge=300, le=2000)
+    deepgram_model: str = "nova-2-phonecall"
+
     # Edge TTS (custom Twilio pipeline only)
     edge_tts_voice: str = "en-US-JennyNeural"
 

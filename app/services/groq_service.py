@@ -29,6 +29,17 @@ class GroqConversationService:
                 + " "
                 + appointment_reminder.build_context_block(context)
             )
+            if history:
+                system += (
+                    " The opening greeting was already played. Continue the conversation; "
+                    "do not re-introduce yourself or repeat the full reminder script."
+                )
+                if any(
+                    "confirm" in (h.get("content") or "").lower()
+                    for h in history
+                    if h.get("role") == "user"
+                ):
+                    system += " The caller already confirmed; do not ask to confirm again."
         else:
             system = (
                 "You are a helpful voice assistant on a phone call. "
@@ -44,7 +55,7 @@ class GroqConversationService:
                 model=self._model,
                 messages=messages,
                 temperature=0.5,
-                max_tokens=100,
+                max_tokens=80,
             )
             return (response.choices[0].message.content or "").strip()
         except Exception:
