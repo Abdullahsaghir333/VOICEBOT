@@ -9,6 +9,7 @@ from app.api.routes import appointments, calls, webhooks
 from app.config import get_settings
 from app.db.mongodb import close_mongodb, get_database
 from app.services.media_stream import MediaStreamSession
+from app.services.twilio_service import VALID_STATUS_CALLBACK_EVENTS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,6 +23,7 @@ async def lifespan(app: FastAPI):
     try:
         await asyncio.wait_for(db.command("ping"), timeout=8.0)
         logger.info("Connected to MongoDB")
+        logger.info("Twilio status_callback_event=%s", list(VALID_STATUS_CALLBACK_EVENTS))
     except asyncio.TimeoutError:
         logger.error("MongoDB ping timed out — check MONGO_URI / Atlas network access")
         raise
@@ -115,6 +117,12 @@ async def media_stream_ws(websocket: WebSocket):
         await session.run()
     except WebSocketDisconnect:
         logger.info("WebSocket /ws/media disconnected")
+    except RuntimeError as exc:
+        if "not connected" in str(exc).lower():
+            logger.info("WebSocket /ws/media closed")
+        else:
+            logger.exception("WebSocket /ws/media error")
+            raise
     except Exception:
         logger.exception("WebSocket /ws/media error")
 

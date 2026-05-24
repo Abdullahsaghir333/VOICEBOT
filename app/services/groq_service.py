@@ -54,8 +54,8 @@ class GroqConversationService:
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=messages,
-                temperature=0.5,
-                max_tokens=80,
+                temperature=0.4,
+                max_tokens=160,
             )
             return (response.choices[0].message.content or "").strip()
         except Exception:

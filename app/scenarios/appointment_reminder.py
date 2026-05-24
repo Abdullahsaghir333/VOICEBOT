@@ -6,21 +6,27 @@ SCENARIO_ID = "appointment_reminder"
 
 SYSTEM_PROMPT = """You are Alex from HealthCare Plus Clinic on a live phone call for an appointment reminder.
 
-Keep every reply to one or two short sentences, under 28 words, for phone audio.
+LANGUAGE (critical):
+- Caller speaks English → reply in English.
+- Caller speaks Urdu (script or Roman Urdu) → reply in Urdu.
+- Mixed English and Urdu → match their mix in the same reply.
 
-Answer the caller's latest question first using only the appointment facts you have.
-If they ask about payment or cost, say this call is only to confirm the visit and any billing is handled at the clinic front desk when they arrive.
-If they ask for details, timing, date, doctor, or location, state those facts clearly from your context.
-If speech seems garbled or unclear, politely ask them to repeat once.
+ANSWERING (critical):
+- When / kab / time: give full appointment DATE and TIME from your facts.
+- Where / location / kahan: give clinic NAME and full ADDRESS.
+- What is it about: reminder with doctor name plus date, time, and location.
+- Never give vague one-word answers. Use exact facts from context; never say you lack info that is listed.
 
-After your opening greeting, do not repeat your full introduction.
-Do not say you lack information that is in your appointment facts.
-If they already confirmed the appointment, do not ask them to confirm again; thank them and answer any new question or say goodbye.
+STYLE: One or two sentences, under 40 words, natural for phone audio.
+After the greeting, do not repeat your full introduction.
+If they already confirmed, do not ask again.
 
-If they want to confirm, thank them and remind them to arrive ten minutes early.
-If they want to reschedule, say the office will call back to reschedule.
-If they cancel, acknowledge politely.
-Never give medical advice. Plain conversational English only."""
+CONFIRM: thank them, ten minutes early, brief goodbye (English or Urdu).
+RESCHEDULE: office will call back, goodbye.
+CANCEL: acknowledge politely, goodbye.
+No medical advice."""
+
+TERMINAL_OUTCOMES = frozenset({"confirmed", "cancelled", "reschedule_requested"})
 
 
 def build_context_block(context: dict[str, Any]) -> str:
@@ -33,13 +39,11 @@ def build_context_block(context: dict[str, Any]) -> str:
         when = "the scheduled time"
 
     return (
-        f"Patient: {context.get('patient_name', 'the patient')}. "
-        f"Appointment: {when}. "
-        f"Provider: {context.get('provider_name', 'Dr. Smith')}. "
-        f"Location: {context.get('clinic_name', 'HealthCare Plus Clinic')}, "
-        f"{context.get('clinic_address', '123 Wellness Ave')}. "
-        f"Purpose: appointment reminder and confirmation only, not payment collection on this call. "
-        f"Status: {context.get('status', 'scheduled')}."
+        f"FACTS TO USE: Patient {context.get('patient_name', 'the patient')}. "
+        f"Appointment {when}. Doctor {context.get('provider_name', 'Dr. Smith')}. "
+        f"Clinic {context.get('clinic_name', 'HealthCare Plus Clinic')}, "
+        f"address {context.get('clinic_address', '123 Wellness Ave')}. "
+        f"Status {context.get('status', 'scheduled')}."
     )
 
 
@@ -47,28 +51,48 @@ def opening_line(context: dict[str, Any]) -> str:
     name = context.get("patient_name", "there")
     return (
         f"Hello, this is Alex from HealthCare Plus Clinic calling for {name}. "
-        f"I have a quick reminder about your upcoming appointment."
+        f"I am calling to remind you about your upcoming appointment."
     )
 
 
 def detect_outcome(user_text: str, assistant_text: str) -> str | None:
-    combined = f"{user_text} {assistant_text}".lower()
-    if any(w in combined for w in ("cancel", "cancellation", "won't make it", "cannot make")):
-        return "cancelled"
-    if any(w in combined for w in ("reschedule", "different time", "another day", "change the time")):
-        return "reschedule_requested"
+    user = user_text.lower().strip()
+    assistant = assistant_text.lower()
+
     if any(
-        w in combined
-        for w in (
-            "confirm",
-            "confirmed",
+        w in user
+        for w in ("cancel", "cancellation", "won't make", "cannot make", "can't make", "nahi aa")
+    ):
+        return "cancelled"
+    if any(w in user for w in ("reschedule", "different time", "another day", "change the time", "dobara")):
+        return "reschedule_requested"
+
+    strong_confirm = any(
+        p in user
+        for p in (
             "i confirm",
             "i confirmed",
-            "see you then",
+            "okay. i confirm",
+            "okay i confirm",
+            "yes i confirm",
             "i'll be there",
+            "i will be there",
+            "see you then",
             "will be there",
             "i will come",
+            "main confirm",
+            "mein confirm",
+            "tasdeeq",
+            "theek hai main aa",
         )
+    ) or user in ("confirmed", "yes confirmed", "yes, confirmed")
+    if strong_confirm:
+        return "confirmed"
+
+    if user in ("yes", "yeah", "yep", "correct", "theek", "ji", "right") and any(
+        p in assistant
+        for p in ("thank", "shukriya", "ten minutes", "goodbye", "allah hafiz", "arrive")
     ):
         return "confirmed"
+
     return None

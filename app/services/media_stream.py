@@ -26,13 +26,17 @@ from app.services.deepgram_stt import (
     parse_final_transcript,
 )
 from app.services.groq_service import GroqConversationService
+from app.services.language import reply_language
 from app.services.stt_filters import (
+    is_incomplete_utterance,
     is_meaningful_transcript,
     normalize_phone_transcript,
     pick_best_transcript,
+    question_intent_fingerprint,
 )
 from app.services.turn_metrics import TurnMetrics
 from app.services.tts_service import chunk_mulaw, synthesize_mulaw
+from app.services.twilio_service import TwilioService
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +75,10 @@ class MediaStreamSession:
         self._queued_user_turn: str | None = None
         self._last_user_turn_normalized: str | None = None
         self._barge_in_unlock_task: asyncio.Task | None = None
+        self._call_finished = False
+        self._last_user_message = ""
+        self._last_intent_fingerprint: str | None = None
+        self._last_intent_at = 0.0
 
         self._call_repo = CallRepository()
         self._appt_repo = AppointmentRepository()
@@ -79,8 +87,15 @@ class MediaStreamSession:
 
     async def run(self) -> None:
         try:
-            while True:
-                message = await self.twilio_ws.receive_text()
+            while not self._call_finished:
+                try:
+                    message = await self.twilio_ws.receive_text()
+                except RuntimeError as exc:
+                    # Expected when we hang up: local close runs before Twilio disconnects.
+                    if self._call_finished or "not connected" in str(exc).lower():
+                        logger.info("Twilio stream ended call_id=%s", self.call_id)
+                        break
+                    raise
                 await self._handle_twilio_message(json.loads(message))
         except (ConnectionClosed, WebSocketDisconnect):
             logger.info("Twilio stream closed call_id=%s", self.call_id)
@@ -98,6 +113,8 @@ class MediaStreamSession:
                 await asyncio.gather(self._deepgram_ws.close(), return_exceptions=True)
 
     async def _handle_twilio_message(self, data: dict[str, Any]) -> None:
+        if self._call_finished:
+            return
         try:
             event = data.get("event")
             if event == "start":
@@ -278,6 +295,8 @@ class MediaStreamSession:
 
     async def _flush_user_turn_after_debounce(self) -> None:
         """Wait for end of utterance, then run one LLM+TTS turn on the best final."""
+        if self._call_finished:
+            return
         delay = self._settings.stt_turn_debounce_ms / 1000.0
         try:
             await asyncio.sleep(delay)
@@ -297,6 +316,18 @@ class MediaStreamSession:
         if self._is_duplicate_user_turn(text):
             logger.debug("Skipping duplicate debounced turn call_id=%s: %s", self.call_id, text)
             return
+
+        if is_incomplete_utterance(text):
+            self._stt_fragments.append(text)
+            self._debounce_task = asyncio.create_task(self._flush_user_turn_after_debounce())
+            logger.debug("Incomplete utterance — waiting for more STT call_id=%s: %s", self.call_id, text)
+            return
+
+        intent = question_intent_fingerprint(text)
+        if intent and intent == self._last_intent_fingerprint:
+            if (time.perf_counter() - self._last_intent_at) < 25.0:
+                logger.info("Skipping repeated %s question call_id=%s", intent, self.call_id)
+                return
 
         if self._processing_turn:
             self._queue_user_turn(text)
@@ -331,6 +362,10 @@ class MediaStreamSession:
             logger.debug("Skipping duplicate user turn call_id=%s", self.call_id)
             return
         self._last_user_turn_normalized = key
+        intent = question_intent_fingerprint(text)
+        if intent:
+            self._last_intent_fingerprint = intent
+            self._last_intent_at = time.perf_counter()
         self._pipeline_task = asyncio.create_task(self._run_turn_pipeline(text))
 
     def _schedule_queued_turn_if_any(self) -> None:
@@ -378,6 +413,7 @@ class MediaStreamSession:
                 logger.info("User said (%s): %s", self.call_id, user_text)
                 await self._call_repo.append_turn(self.call_id, "user", user_text)
             self.history.append({"role": "user", "content": user_text})
+            self._last_user_message = user_text
 
             if self._interrupt.is_set():
                 return
@@ -395,13 +431,15 @@ class MediaStreamSession:
                 return
 
             tts_start = time.perf_counter()
-            await self._speak(reply, save_to_history=True)
+            lang = reply_language(user_text, reply)
+            await self._speak(reply, save_to_history=True, lang=lang)
             tts_ms = (time.perf_counter() - tts_start) * 1000
             logger.info(
-                "Assistant spoke call_id=%s tts_ms=%.0f chars=%d",
+                "Assistant spoke call_id=%s tts_ms=%.0f chars=%d lang=%s",
                 self.call_id,
                 tts_ms,
                 len(reply),
+                lang,
             )
 
             metric_payload = metrics.finish(
@@ -422,9 +460,17 @@ class MediaStreamSession:
             outcome = appointment_reminder.detect_outcome(user_text, reply)
             if outcome:
                 await self._apply_outcome(outcome)
+
+            if outcome in appointment_reminder.TERMINAL_OUTCOMES:
+                logger.info("Terminal outcome %s — ending call call_id=%s", outcome, self.call_id)
+                await asyncio.sleep(1.2)
+                await self._finalize_call(outcome)
+                return
+
             if any(p in reply.lower() for p in ("goodbye", "good bye", "take care", "have a great day")):
                 await asyncio.sleep(1.0)
                 await self._finalize_call(outcome or "completed")
+                return
 
         except asyncio.CancelledError:
             logger.info("Pipeline cancelled (barge-in) call_id=%s", self.call_id)
@@ -437,7 +483,8 @@ class MediaStreamSession:
         finally:
             self._processing_turn = False
             self._interrupt.clear()
-            await self._maybe_run_queued_turn()
+            if not self._call_finished:
+                await self._maybe_run_queued_turn()
 
     async def _enable_barge_in_after_delay(self, delay: float) -> None:
         """Enable barge-in after playback started (avoids echo on SpeechStarted)."""
@@ -451,7 +498,7 @@ class MediaStreamSession:
         finally:
             self._barge_in_unlock_task = None
 
-    async def _speak(self, text: str, *, save_to_history: bool = False) -> None:
+    async def _speak(self, text: str, *, save_to_history: bool = False, lang: str = "en") -> None:
         if not text or not self.stream_sid:
             return
 
@@ -461,8 +508,8 @@ class MediaStreamSession:
         self._cancel_barge_in_unlock_task()
 
         try:
-            audio = await synthesize_mulaw(text)
-            logger.debug("TTS ready call_id=%s bytes=%d", self.call_id, len(audio))
+            audio = await synthesize_mulaw(text, lang=lang)
+            logger.debug("TTS ready call_id=%s bytes=%d lang=%s", self.call_id, len(audio), lang)
             if self._interrupt.is_set():
                 await self._clear_twilio_playback()
                 return
@@ -531,9 +578,34 @@ class MediaStreamSession:
             await self._call_repo.update_status(self.call_id, "in_progress", outcome=outcome)
 
     async def _finalize_call(self, outcome: str | None = None) -> None:
+        if self._call_finished:
+            return
+        self._call_finished = True
+        self._stopped = True
+        self._queued_user_turn = None
+
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        self._cancel_barge_in_unlock_task()
+
+        resolved_outcome = outcome or (
+            self.call_record.get("outcome") if self.call_record else "completed"
+        )
         if self.call_id:
             await self._call_repo.update_status(
                 self.call_id,
                 "completed",
-                outcome=outcome or (self.call_record.get("outcome") if self.call_record else "completed"),
+                outcome=resolved_outcome,
             )
+            logger.info("Call completed call_id=%s outcome=%s", self.call_id, resolved_outcome)
+
+        if self.call_id and (not self.call_record or not self.call_record.get("twilio_call_sid")):
+            self.call_record = await self._call_repo.get_by_id(self.call_id)
+
+        sid = self.call_record.get("twilio_call_sid") if self.call_record else None
+        if sid:
+            try:
+                await asyncio.to_thread(TwilioService().hangup_call, sid)
+            except Exception:
+                logger.exception("Failed to hang up Twilio call call_id=%s sid=%s", self.call_id, sid)
+        # Do not close twilio_ws here — Twilio closes the stream after hangup; run() exits cleanly.

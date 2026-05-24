@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".ENV"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -34,8 +34,8 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("TWILIO_PHONE_NUMBER", "TWILLIO_PHONE_NUMBER"),
     )
-    # Seconds to ring before Twilio gives up (5–600). Does not fix instant "busy" from carrier.
-    twilio_call_timeout: int = Field(default=60, ge=5, le=600)
+    # Seconds the callee's phone rings before no-answer (60–600). Twilio API "timeout".
+    twilio_call_timeout: int = Field(default=60, ge=60, le=600)
 
     # Deepgram (STT) — DEEPGRAM_API_KEY or STT= in .ENV
     deepgram_api_key: str = Field(
@@ -55,6 +55,7 @@ class Settings(BaseSettings):
 
     # Edge TTS
     edge_tts_voice: str = "en-US-JennyNeural"
+    edge_tts_voice_urdu: str = "ur-PK-UzmaNeural"
 
     # App
     api_host: str = "0.0.0.0"

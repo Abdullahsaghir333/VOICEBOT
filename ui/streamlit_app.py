@@ -158,6 +158,10 @@ with tab_call:
             data = r.json()
             sid = data.get("twilio_call_sid") or "—"
             st.success(f"Call started — ID `{data['id']}` · Twilio SID `{sid}`")
+            st.info(
+                "Your phone can ring for up to **60 seconds** before Twilio gives up. "
+                "Answer when it rings; on a **trial** account, press **1** after answering."
+            )
             st.json(data)
         else:
             st.error(r.text)

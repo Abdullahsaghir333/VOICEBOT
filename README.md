@@ -160,7 +160,7 @@ Open **http://localhost:8501**
 | `TWILIO_ACCOUNT_SID` | Yes | Twilio account SID |
 | `TWILIO_AUTH_TOKEN` | Yes | Twilio auth token |
 | `TWILIO_PHONE_NUMBER` | Yes | Outbound caller ID (E.164) |
-| `TWILIO_CALL_TIMEOUT` | No | Ring timeout in seconds (default `60`) |
+| `TWILIO_CALL_TIMEOUT` | No | Ring time before no-answer, **60–600** seconds (default `60`) |
 | `DEEPGRAM_API_KEY` | Yes | Deepgram key (`STT=` alias also supported) |
 | `DEEPGRAM_MODEL` | No | Default `nova-2-phonecall` |
 | `STT_TURN_DEBOUNCE_MS` | No | Wait after last STT final before LLM (default `1100`) |

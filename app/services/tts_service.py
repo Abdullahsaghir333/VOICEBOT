@@ -15,10 +15,11 @@ TWILIO_SAMPLE_RATE = 8000
 EDGE_TTS_TIMEOUT_SECONDS = 8.0
 
 
-async def synthesize_mulaw(text: str) -> bytes:
+async def synthesize_mulaw(text: str, *, lang: str = "en") -> bytes:
     """Convert text to μ-law 8 kHz audio for Twilio Media Streams."""
     settings = get_settings()
-    communicate = edge_tts.Communicate(text, voice=settings.edge_tts_voice)
+    voice = settings.edge_tts_voice_urdu if lang == "ur" else settings.edge_tts_voice
+    communicate = edge_tts.Communicate(text, voice=voice)
 
     mp3_buffer = io.BytesIO()
     try:
