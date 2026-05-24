@@ -12,23 +12,57 @@ router = APIRouter(prefix="/webhooks/twilio", tags=["twilio"])
 call_repo = CallRepository()
 
 
-@router.post("/voice")
+def _voice_twiml(call_id: str) -> str:
+    settings = get_settings()
+    stream_url = settings.media_stream_ws_url
+    base = settings.public_base_url.rstrip("/")
+    stream_status = f"{base}/webhooks/twilio/stream-status?call_id={call_id}"
+    # Connect + Stream: track must be inbound_track or omitted (default).
+    # both_tracks is only valid with <Start>, not <Connect> — causes Twilio 31941.
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="{stream_url}" track="inbound_track" statusCallback="{stream_status}" statusCallbackMethod="POST">
+      <Parameter name="call_id" value="{call_id}" />
+    </Stream>
+  </Connect>
+</Response>"""
+
+
+@router.api_route("/voice", methods=["GET", "POST"])
 async def twilio_voice_webhook(
     request: Request,
     call_id: str = Query(...),
 ):
     settings = get_settings()
-    stream_url = settings.media_stream_ws_url
-    logger.info("Twilio voice webhook call_id=%s stream=%s", call_id, stream_url)
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="{stream_url}">
-      <Parameter name="call_id" value="{call_id}" />
-    </Stream>
-  </Connect>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
+    logger.info(
+        "Twilio VOICE webhook (%s) call_id=%s stream=%s",
+        request.method,
+        call_id,
+        settings.media_stream_ws_url,
+    )
+    return Response(content=_voice_twiml(call_id), media_type="application/xml")
+
+
+@router.api_route("/stream-status", methods=["GET", "POST"])
+async def twilio_stream_status(
+    request: Request,
+    call_id: str = Query(""),
+):
+    """Twilio posts here when Media Stream starts, errors, or stops (debug stream vs phone)."""
+    if request.method == "POST":
+        form = await request.form()
+        payload = dict(form)
+    else:
+        payload = dict(request.query_params)
+    logger.info(
+        "Twilio STREAM event call_id=%s event=%s error=%s payload=%s",
+        call_id,
+        payload.get("StreamEvent"),
+        payload.get("StreamError"),
+        payload,
+    )
+    return Response(content="", status_code=204)
 
 
 @router.post("/status")

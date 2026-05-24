@@ -8,5 +8,5 @@ if not exist "venv\Scripts\python.exe" (
 
 REM Use 8001 if 8000 is stuck (Errno 10048). Set API_PORT in .env to change.
 set API_PORT=8001
-echo Starting API on http://127.0.0.1:%API_PORT%
-venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port %API_PORT%
+echo Starting API on http://0.0.0.0:%API_PORT%
+venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port %API_PORT%

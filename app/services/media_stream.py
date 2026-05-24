@@ -54,6 +54,8 @@ class MediaStreamSession:
 
         self._agent_speaking = False
         self._processing_turn = False
+        # Avoid VAD false barge-in during opening greeting (kills TTS before you hear it).
+        self._barge_in_enabled = False
 
         self._call_repo = CallRepository()
         self._appt_repo = AppointmentRepository()
@@ -61,7 +63,6 @@ class MediaStreamSession:
         self._settings = get_settings()
 
     async def run(self) -> None:
-        self._deepgram_task = asyncio.create_task(self._deepgram_loop())
         try:
             while True:
                 message = await self.twilio_ws.receive_text()
@@ -90,6 +91,9 @@ class MediaStreamSession:
                 await self._load_call_context()
                 if self.call_id:
                     await self._call_repo.update_status(self.call_id, "in_progress")
+                self._deepgram_ready.clear()
+                if self._deepgram_task is None or self._deepgram_task.done():
+                    self._deepgram_task = asyncio.create_task(self._deepgram_loop())
                 try:
                     await asyncio.wait_for(self._deepgram_ready.wait(), timeout=5.0)
                 except asyncio.TimeoutError:
@@ -120,11 +124,13 @@ class MediaStreamSession:
         url = build_listen_url()
 
         while not self._stopped:
+            keepalive_task: asyncio.Task | None = None
             try:
                 async with websockets.connect(url, additional_headers=headers) as dg_ws:
                     self._deepgram_ws = dg_ws
                     self._deepgram_ready.set()
                     logger.info("Deepgram connected (final-only STT) call_id=%s", self.call_id)
+                    keepalive_task = asyncio.create_task(self._deepgram_keepalive(dg_ws))
 
                     while not self._stopped:
                         if self._restart_deepgram.is_set():
@@ -144,16 +150,39 @@ class MediaStreamSession:
 
             except asyncio.CancelledError:
                 break
+            except ConnectionClosed as exc:
+                if not self._stopped:
+                    logger.warning(
+                        "Deepgram closed call_id=%s (%s) — reconnecting",
+                        self.call_id,
+                        exc,
+                    )
+                    await asyncio.sleep(0.5)
             except Exception:
                 logger.exception("Deepgram connection error call_id=%s", self.call_id)
                 if not self._stopped:
                     await asyncio.sleep(0.5)
             finally:
+                if keepalive_task:
+                    keepalive_task.cancel()
+                    await asyncio.gather(keepalive_task, return_exceptions=True)
                 self._deepgram_ws = None
+
+    async def _deepgram_keepalive(self, dg_ws: Any) -> None:
+        """Prevent NET0001 idle timeout while the bot is speaking (no inbound audio yet)."""
+        try:
+            while not self._stopped and self._deepgram_ws is dg_ws:
+                await asyncio.sleep(8)
+                await dg_ws.send(json.dumps({"type": "KeepAlive"}))
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Deepgram keepalive stopped call_id=%s", self.call_id)
 
     async def _handle_deepgram_message(self, data: dict[str, Any]) -> None:
         if is_speech_started(data):
-            if self._agent_speaking or self._processing_turn:
+            # Only interrupt while assistant audio is playing — not during LLM or greeting setup.
+            if self._barge_in_enabled and self._agent_speaking:
                 await self._handle_barge_in()
             return
 
@@ -199,10 +228,15 @@ class MediaStreamSession:
     async def _run_turn_pipeline(self, user_text: str, *, is_greeting: bool = False) -> None:
         if is_greeting:
             try:
-                self._agent_speaking = True
                 tts_start = time.perf_counter()
                 await self._speak(user_text, save_to_history=True)
                 tts_ms = (time.perf_counter() - tts_start) * 1000
+                logger.info(
+                    "Greeting played call_id=%s tts_ms=%.0f chars=%d",
+                    self.call_id,
+                    tts_ms,
+                    len(user_text),
+                )
                 if self.call_id:
                     await self._call_repo.append_turn(
                         self.call_id,
@@ -213,7 +247,7 @@ class MediaStreamSession:
             except Exception:
                 logger.exception("Greeting playback error call_id=%s", self.call_id)
             finally:
-                self._agent_speaking = False
+                self._barge_in_enabled = True
             return
 
         self._processing_turn = True
@@ -245,6 +279,12 @@ class MediaStreamSession:
             tts_start = time.perf_counter()
             await self._speak(reply, save_to_history=True)
             tts_ms = (time.perf_counter() - tts_start) * 1000
+            logger.info(
+                "Assistant spoke call_id=%s tts_ms=%.0f chars=%d",
+                self.call_id,
+                tts_ms,
+                len(reply),
+            )
 
             metric_payload = metrics.finish(
                 assistant_text=reply,
@@ -287,6 +327,11 @@ class MediaStreamSession:
         self._agent_speaking = True
         try:
             audio = await synthesize_mulaw(text)
+            logger.debug(
+                "TTS ready call_id=%s bytes=%d",
+                self.call_id,
+                len(audio),
+            )
             if self._interrupt.is_set():
                 await self._clear_twilio_playback()
                 return

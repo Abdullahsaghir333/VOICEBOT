@@ -103,10 +103,19 @@ async def public_config():
     }
 
 
+def _is_likely_twilio_peer(host: str | None) -> bool:
+    """Twilio status/webhook IPs are AWS ranges; your wscat test uses your home IP."""
+    if not host:
+        return False
+    return not host.startswith("2407:") and not host.startswith("::1") and host not in ("127.0.0.1", "localhost")
+
+
 @app.websocket("/ws/media")
 async def media_stream_ws(websocket: WebSocket):
     await websocket.accept()
-    logger.info("WebSocket /ws/media connected from %s", websocket.client)
+    host = websocket.client.host if websocket.client else None
+    source = "TWILIO?" if _is_likely_twilio_peer(host) else "local/test"
+    logger.info("WebSocket /ws/media connected from %s (%s)", websocket.client, source)
     try:
         session = MediaStreamSession(websocket)
         await session.run()

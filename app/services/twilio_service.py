@@ -16,26 +16,25 @@ class TwilioService:
         self._status_callback_url = (
             f"{settings.public_base_url.rstrip('/')}/webhooks/twilio/status"
         )
-
-    def _build_twiml(self, call_id: str) -> str:
-        """Inline TwiML — avoids extra HTTP fetch to /voice (ngrok issues)."""
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="{self._stream_url}" track="both_tracks">
-      <Parameter name="call_id" value="{call_id}" />
-    </Stream>
-  </Connect>
-</Response>"""
+        self._ring_timeout = settings.twilio_call_timeout
 
     def place_outbound_call(self, to_number: str, call_id: str) -> str:
-        twiml = self._build_twiml(call_id)
-        logger.info("Placing call to %s stream=%s", to_number, self._stream_url)
+        settings = get_settings()
+        voice_url = f"{settings.public_base_url.rstrip('/')}/webhooks/twilio/voice?call_id={call_id}"
+        logger.info(
+            "Placing call to %s voice_url=%s stream=%s ring_timeout=%ss",
+            to_number,
+            voice_url,
+            self._stream_url,
+            self._ring_timeout,
+        )
 
         call = self._client.calls.create(
             to=to_number,
             from_=self._from_number,
-            twiml=twiml,
+            url=voice_url,
+            method="POST",
+            timeout=self._ring_timeout,
             status_callback=f"{self._status_callback_url}?call_id={call_id}",
             status_callback_event=["initiated", "ringing", "answered", "completed"],
             status_callback_method="POST",

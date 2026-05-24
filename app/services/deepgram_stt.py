@@ -18,10 +18,11 @@ def build_listen_url() -> str:
         "channels": "1",
         "model": "nova-2",
         "language": "en",
+        # Final transcripts only for LLM (see parse_final_transcript). Do not set
+        # utterance_end_ms here — Deepgram returns HTTP 400 unless interim_results=true.
         "interim_results": "false",
         "vad_events": "true",
         "endpointing": "400",
-        "utterance_end_ms": "1000",
         "punctuate": "true",
         "smart_format": "true",
     }

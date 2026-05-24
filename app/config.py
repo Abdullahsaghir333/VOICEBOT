@@ -34,6 +34,8 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("TWILIO_PHONE_NUMBER", "TWILLIO_PHONE_NUMBER"),
     )
+    # Seconds to ring before Twilio gives up (5–600). Does not fix instant "busy" from carrier.
+    twilio_call_timeout: int = Field(default=60, ge=5, le=600)
 
     # Deepgram (STT) — DEEPGRAM_API_KEY or STT= in .ENV
     deepgram_api_key: str = Field(
